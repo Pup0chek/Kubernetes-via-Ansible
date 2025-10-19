@@ -1,0 +1,12 @@
+- hosts: nodes
+  become: yes
+  serial: 1
+  roles:
+    - role: 'roles/update-and-reboot'
+
+- hosts: "control_planes:!master"
+  become: yes
+  serial: 1
+  roles:
+    - role: 'roles/update-and-reboot'
+

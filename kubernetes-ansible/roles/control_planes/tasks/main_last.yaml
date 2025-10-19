@@ -1,0 +1,70 @@
+# Инициализация control-plane c корректным CRI-сокетом и предзагрузкой образов.
+# Доп. флаги можно передать через init_opts (например, "--ignore-preflight-errors=NumCPU").
+
+- name: Reset Kubernetes on control-plane (safe if already clean)
+  ansible.builtin.command: kubeadm reset -f
+  ignore_errors: true
+
+- name: Pre-pull control-plane images (faster & clearer logs)
+  ansible.builtin.command: >
+    kubeadm config images pull
+    --kubernetes-version {{ kube_version }}
+    --cri-socket unix:///var/run/containerd/containerd.sock
+
+- name: Init Kubernetes cluster
+  ansible.builtin.command: >
+    kubeadm init
+    --service-cidr {{ service_cidr | default('10.96.0.0/12') }}
+    --kubernetes-version {{ kube_version }}
+    --pod-network-cidr {{ pod_network_cidr | default('10.244.0.0/16') }}
+    --apiserver-advertise-address {{ control_plane_ip }}
+    --cri-socket unix:///var/run/containerd/containerd.sock
+    {{ init_opts | default('') }}
+    --v=5
+  args:
+    creates: /etc/kubernetes/admin.conf
+  register: kubeadm_init
+
+# (дальше — шаги проекта: копия kubeconfig пользователю, CNI и т.п.)
+# Копируем kubeconfig пользователю admin (если нужно)
+- name: Ensure /home/admin/.kube exists
+  ansible.builtin.file:
+    path: /home/admin/.kube
+    state: directory
+    owner: admin
+    group: admin
+    mode: "0700"
+
+- name: Copy admin.conf to user kubeconfig
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /home/admin/.kube/config
+    owner: admin
+    group: admin
+    mode: "0600"
+    remote_src: true
+
+# Ставим Tigera Operator
+- name: Install Tigera Operator
+  ansible.builtin.command: >
+    kubectl --kubeconfig /etc/kubernetes/admin.conf
+    apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.30.4/manifests/tigera-operator.yaml
+
+# Применяем Installation с нужным CIDR
+- name: Apply Calico Installation (10.244.0.0/16)
+  ansible.builtin.shell: |
+    cat <<'EOF' | kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f -
+    apiVersion: operator.tigera.io/v1
+    kind: Installation
+    metadata:
+      name: default
+    spec:
+      calicoNetwork:
+        ipPools:
+          - name: default-ipv4-ippool
+            cidr: 10.244.0.0/16
+            encapsulation: VXLAN
+            natOutgoing: Enabled
+            nodeSelector: all()
+
+          EOF

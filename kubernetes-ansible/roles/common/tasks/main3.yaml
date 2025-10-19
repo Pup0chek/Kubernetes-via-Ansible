@@ -1,0 +1,61 @@
+# ===== PREP =====
+- name: ensure keyrings dir exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: install prerequisites for repo keys
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+    state: present
+    update_cache: yes
+
+# ===== DOCKER REPO (containerd.io из docker repo) =====
+- name: install Docker GPG key (dearmored)
+  ansible.builtin.shell: |
+    set -e
+    curl -fsSL https://download.docker.com/linux/debian/gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+  args:
+    creates: /etc/apt/keyrings/docker.gpg
+
+- name: add Docker apt repository (Debian {{ ansible_distribution_release }})
+  ansible.builtin.deb822_repository:
+    name: docker
+    types: [deb]
+    uris: "https://download.docker.com/linux/debian"
+    suites: "{{ ansible_distribution_release }}"   # на Debian 13 будет 'trixie'
+    components: [stable]
+    signed_by: /etc/apt/keyrings/docker.gpg
+    state: present
+
+# ===== KUBERNETES REPO (новый pkgs.k8s.io) =====
+# Выберите требуемую минорную ветку (пример: v1.34 — актуально на сегодня)
+- name: install Kubernetes GPG key (dearmored)
+  ansible.builtin.shell: |
+    set -e
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key \
+      | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    chmod a+r /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: add Kubernetes apt repository (pkgs.k8s.io v1.34)
+  ansible.builtin.deb822_repository:
+    name: kubernetes
+    types: [deb]
+    uris: "https://pkgs.k8s.io/core:/stable:/v1.34/deb/"
+    suites: ["/"]                     # у pkgs.k8s.io suite — корень
+    components: []
+    signed_by: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    state: present
+
+# (опционально) сразу обновить кеш
+- name: apt update
+  ansible.builtin.apt:
+    update_cache: yes

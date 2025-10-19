@@ -1,0 +1,85 @@
+# Проверяем, инициализирован ли уже control-plane (есть ли admin.conf)
+- name: Check if admin.conf exists
+  ansible.builtin.stat:
+    path: /etc/kubernetes/admin.conf
+  register: adminconf
+
+# Сбрасываем кластер ТОЛЬКО если его ещё нет (чтобы не снести рабочий init)
+- name: Reset Kubernetes on control-plane (run only when not initialized)
+  ansible.builtin.command: kubeadm reset -f
+  when: not adminconf.stat.exists
+
+- name: Pre-pull control-plane images (faster & clearer logs)
+  ansible.builtin.command: >
+    kubeadm config images pull
+    --kubernetes-version {{ kube_version }}
+    --cri-socket unix:///var/run/containerd/containerd.sock
+
+- name: Init Kubernetes cluster
+  ansible.builtin.command: >
+    kubeadm init
+    --service-cidr {{ service_cidr | default('10.96.0.0/12') }}
+    --kubernetes-version {{ kube_version }}
+    --pod-network-cidr {{ pod_network_cidr | default('10.244.0.0/16') }}
+    --apiserver-advertise-address {{ control_plane_ip }}
+    --cri-socket unix:///var/run/containerd/containerd.sock
+    {{ init_opts | default('') }}
+    --v=5
+  args:
+    creates: /etc/kubernetes/admin.conf
+  register: kubeadm_init
+
+# kubeconfig пользователю (как у вас)
+- name: Ensure /home/admin/.kube exists
+  ansible.builtin.file:
+    path: /home/admin/.kube
+    state: directory
+    owner: admin
+    group: admin
+    mode: "0700"
+
+- name: Copy admin.conf to user kubeconfig
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /home/admin/.kube/config
+    owner: admin
+    group: admin
+    mode: "0600"
+    remote_src: true
+
+# Ставим Tigera Operator
+- name: Install Tigera Operator
+  ansible.builtin.command: >
+    kubectl --kubeconfig /etc/kubernetes/admin.conf
+    apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.30.4/manifests/tigera-operator.yaml
+
+# Ждём, пока появится CRD Installation (иначе следующий шаг может не успеть)
+- name: Wait for Tigera Installation CRD
+  ansible.builtin.shell: >
+    kubectl --kubeconfig /etc/kubernetes/admin.conf
+    get crd installations.operator.tigera.io
+  register: crd_check
+  retries: 30
+  delay: 5
+  until: crd_check.rc == 0
+  changed_when: false
+
+# Применяем Installation с нужным CIDR (не забываем закрыть EOF)
+- name: Apply Calico Installation (10.244.0.0/16)
+  ansible.builtin.shell: |
+    cat <<'EOF' | kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f -
+    apiVersion: operator.tigera.io/v1
+    kind: Installation
+    metadata:
+      name: default
+    spec:
+      calicoNetwork:
+        ipPools:
+          - name: default-ipv4-ippool
+            cidr: 10.244.0.0/16
+            encapsulation: VXLAN
+            natOutgoing: Enabled
+            nodeSelector: all()
+    EOF
+  args:
+    executable: /bin/bash

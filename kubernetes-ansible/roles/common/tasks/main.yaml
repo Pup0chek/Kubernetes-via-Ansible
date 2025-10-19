@@ -1,0 +1,181 @@
+# Debian 13 (trixie): контейнерный рантайм + K8s репо без apt-key
+
+- name: Disable swap
+  ansible.builtin.shell: |
+    set -e
+    swapoff -a
+    sed -i '/[[:space:]]swap[[:space:]]/ s/^\(.*\)$/#\1/g' /etc/fstab
+
+- name: Load required kernel modules (overlay, br_netfilter)
+  ansible.builtin.shell: |
+    set -e
+    modprobe overlay
+    modprobe br_netfilter
+
+- name: Ensure modules-load.d file for containerd exists
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/containerd.conf
+    content: |
+      overlay
+      br_netfilter
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Ensure sysctl for Kubernetes networking exists
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-kubernetes-cri.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Apply sysctl
+  ansible.builtin.command: sysctl --system
+
+# ==== APT keyrings & repos (NO apt-key) ====
+
+- name: Ensure /etc/apt/keyrings exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Install APT prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+    state: present
+    update_cache: yes
+
+# ---- Docker repo (for containerd.io) ----
+- name: Install Docker GPG key (dearmored)
+  ansible.builtin.shell: |
+    set -e
+    curl -fsSL https://download.docker.com/linux/debian/gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+  args:
+    creates: /etc/apt/keyrings/docker.gpg
+
+- name: Add Docker APT repository (Debian {{ ansible_distribution_release }})
+  ansible.builtin.deb822_repository:
+    name: docker
+    types: [deb]
+    uris: https://download.docker.com/linux/debian
+    suites: "{{ ansible_distribution_release }}"
+    components: [stable]
+    signed_by: /etc/apt/keyrings/docker.gpg
+    state: present
+
+# ---- Kubernetes repo (pkgs.k8s.io v1.34) ----
+- name: Install Kubernetes GPG key (dearmored)
+  ansible.builtin.shell: |
+    set -e
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key \
+      | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    chmod a+r /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: Add Kubernetes APT repository (pkgs.k8s.io v1.34)
+  ansible.builtin.deb822_repository:
+    name: kubernetes
+    types: [deb]
+    uris: https://pkgs.k8s.io/core:/stable:/v1.34/deb/
+    suites: ["/"]
+    components: []
+    signed_by: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    state: present
+
+- name: apt update
+  ansible.builtin.apt:
+    update_cache: yes
+
+# ==== Packages ====
+
+- name: Install containerd.io and cri-tools
+  ansible.builtin.apt:
+    name:
+      - containerd.io
+      - cri-tools
+    state: present
+
+- name: Generate default containerd config if missing
+  ansible.builtin.shell: |
+    set -e
+    test -f /etc/containerd/config.toml || {
+      mkdir -p /etc/containerd
+      containerd config default > /etc/containerd/config.toml
+    }
+  args:
+    creates: /etc/containerd/config.toml
+
+- name: Ensure SystemdCgroup=true in containerd config
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: '^\s*SystemdCgroup\s*=\s*false'
+    replace: '            SystemdCgroup = true'
+  notify: Restart containerd
+
+- name: Ensure default_runtime_name = "runc" in CRI containerd section
+  ansible.builtin.blockinfile:
+    path: /etc/containerd/config.toml
+    marker: "# {mark} ANSIBLE default_runtime_name"
+    insertafter: '^\[plugins\."io.containerd.grpc.v1.cri"\.containerd\]'
+    block: |
+      default_runtime_name = "runc"
+  notify: Restart containerd
+
+- name: Set CRI sandbox (pause) image to registry.k8s.io/pause:3.10.1
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: '^\s*sandbox_image\s*=\s*".*"'
+    replace: '    sandbox_image = "registry.k8s.io/pause:3.10.1"'
+  notify: Restart containerd
+
+- name: Ensure containerd service enabled and started
+  ansible.builtin.systemd:
+    name: containerd
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Install Kubernetes components (repo controls the minor branch)
+  ansible.builtin.apt:
+    name:
+      - kubelet
+      - kubeadm
+      - kubectl
+    state: present
+    update_cache: yes
+
+- name: Hold Kubernetes components (prevent unintended upgrades)
+  ansible.builtin.shell: |
+    set -e
+    apt-mark hold kubelet kubeadm kubectl containerd
+  changed_when: false
+
+# На control-plane kubelet должен работать во время init
+- name: Enable+start kubelet on control-planes
+  ansible.builtin.systemd:
+    name: kubelet
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: "'control_planes' in group_names"
+
+# На worker-нODAX держим kubelet остановленным до join
+- name: Enable kubelet but keep it stopped on workers (until join)
+  ansible.builtin.systemd:
+    name: kubelet
+    enabled: true
+    state: stopped
+    daemon_reload: true
+  when: "'nodes' in group_names"
+

@@ -1,0 +1,21 @@
+# Инициализация control-plane с корректным CRI-сокетом.
+# Доп. флаги можно передать через init_opts (например, "--ignore-preflight-errors=NumCPU").
+
+- name: Reset Kubernetes on control-plane (safe if already clean)
+  ansible.builtin.command: kubeadm reset -f
+  ignore_errors: true
+
+- name: Init Kubernetes cluster
+  ansible.builtin.command: >
+    kubeadm init
+    --service-cidr {{ service_cidr | default('10.96.0.0/12') }}
+    --kubernetes-version {{ kube_version }}
+    --pod-network-cidr {{ pod_network_cidr | default('10.244.0.0/16') }}
+    --apiserver-advertise-address {{ control_plane_ip }}
+    --cri-socket unix:///var/run/containerd/containerd.sock
+    {{ init_opts | default('') }}
+  args:
+    creates: /etc/kubernetes/admin.conf
+  register: kubeadm_init
+
+# Дальше — как в исходной роли проекта (копирование kubeconfig, установка CNI и т.п.)

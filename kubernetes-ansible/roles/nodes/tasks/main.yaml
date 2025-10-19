@@ -1,0 +1,73 @@
+# roles/nodes/tasks/main.yaml
+
+# 1) Ждем, пока API server полностью встанет (на master)
+- name: wait for API server livez on master
+  ansible.builtin.shell: "curl -ksSf --connect-timeout 2 https://127.0.0.1:6443/livez >/dev/null"
+  delegate_to: "{{ groups['control_planes'][0] }}"
+  become: true
+  register: livez
+  retries: 30
+  delay: 5
+  until: livez.rc == 0
+  run_once: true
+
+# 2) Генерируем join-команду НА master, ЯВНО указывая kubeconfig
+- name: generate join command on master (with kubeconfig)
+  ansible.builtin.command: >
+    kubeadm token create --print-join-command
+    --kubeconfig /etc/kubernetes/admin.conf
+  delegate_to: "{{ groups['control_planes'][0] }}"
+  become: true
+  register: join_cmd
+  retries: 5
+  delay: 5
+  until: join_cmd.rc == 0
+  run_once: true
+
+# 3) Показываем join-команду в логах (удобно для отладки)
+- name: debug join command
+  ansible.builtin.debug:
+    var: join_cmd.stdout
+  run_once: true
+
+# 0) На всякий случай останавливаем kubelet, чтобы освободить 10250
+- name: Stop kubelet before (re)join
+  ansible.builtin.systemd:
+    name: kubelet
+    state: stopped
+    enabled: true
+  ignore_errors: true
+
+# 1) Сбрасываем состояние kubeadm; безопасно, если нода "чистая"
+- name: kubeadm reset (safe if already clean)
+  ansible.builtin.command: kubeadm reset -f
+  register: reset_out
+  failed_when: false
+  changed_when: reset_out.rc == 0
+
+# 2) Подчищаем файлы, из-за которых ругается preflight
+- name: Remove leftovers that trigger preflight
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/kubernetes/kubelet.conf
+    - /etc/kubernetes/pki/ca.crt
+    - /var/lib/kubelet/pki
+  ignore_errors: true
+
+# 3) (ВАЖНО) Убеждаемся, что порт 10250 свободен
+- name: Ensure port 10250 is free
+  ansible.builtin.shell: "ss -lntp | grep -q ':10250' && exit 1 || exit 0"
+  register: port_check
+  changed_when: false
+
+# 4) Присоединяем ноду (ваша существующая задача)
+- name: join nodes to the cluster
+  ansible.builtin.command: >
+    {{ join_cmd.stdout }} --cri-socket unix:///var/run/containerd/containerd.sock {{ join_opts }}
+  register: join_out
+  changed_when: "'This node has joined the cluster' in (join_out.stdout | default(''))"
+
+
+

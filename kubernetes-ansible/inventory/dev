@@ -1,0 +1,12 @@
+[control_planes]
+master ansible_host=192.168.0.102
+
+[nodes]
+worker1 ansible_host=192.168.0.169
+worker2 ansible_host=192.168.0.166
+worker3 ansible_host=192.168.0.82
+
+[all:vars]
+ansible_user=admin
+ansible_become=true
+
